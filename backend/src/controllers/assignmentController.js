@@ -1,4 +1,3 @@
-
 import pool from "../config/db.js";
 
 // 1. Create a new assignment (Admin only)
@@ -41,8 +40,8 @@ export const createAssignment = async (req, res) => {
        RETURNING *`,
       [
         title.trim(),
-        description || null,
-        onedrive_link || null,
+        description ? description.trim() : null,
+        onedrive_link ? onedrive_link.trim() : null,
         deadline || null,
         Boolean(target_all_students),
         req.user.id,
@@ -62,7 +61,8 @@ export const createAssignment = async (req, res) => {
 
         await client.query(
           `INSERT INTO assignment_groups (assignment_id, group_id)
-           VALUES ($1, $2)`,
+           VALUES ($1, $2)
+           ON CONFLICT (assignment_id, group_id) DO NOTHING`,
           [assignment.id, groupId]
         );
       }
@@ -81,7 +81,7 @@ export const createAssignment = async (req, res) => {
 
     return res.status(500).json({
       success: false,
-      message: "Failed to create assignment",
+      message: error.message || "Failed to create assignment",
     });
   } finally {
     client.release();
@@ -89,16 +89,22 @@ export const createAssignment = async (req, res) => {
 };
 
 // 2. Get assignments available to the logged-in student
-
 export const getStudentAssignments = async (req, res) => {
   try {
     const result = await pool.query(
       `SELECT DISTINCT
-          a.*,
+          a.id,
+          a.title,
+          a.description,
+          a.onedrive_link,
+          a.deadline,
+          a.target_all_students,
+          a.created_at,
           gm.group_id,
           g.group_name,
           s.status AS submission_status,
-          s.confirmed_at
+          s.confirmed_at,
+          u.name AS confirmed_by_name
        FROM assignments a
        JOIN group_members gm ON gm.user_id = $1
        JOIN groups g ON g.id = gm.group_id
@@ -108,6 +114,7 @@ export const getStudentAssignments = async (req, res) => {
        LEFT JOIN submissions s
           ON s.assignment_id = a.id
           AND s.group_id = gm.group_id
+       LEFT JOIN users u ON u.id = s.confirmed_by
        WHERE a.target_all_students = TRUE
           OR ag.group_id IS NOT NULL
        ORDER BY a.deadline ASC NULLS LAST, a.created_at DESC`,
@@ -128,11 +135,12 @@ export const getStudentAssignments = async (req, res) => {
   }
 };
 
-
-// 3. Get assignments created by the logged-in admin
-
+// 3. Get assignments created by the admin
 export const getAdminAssignments = async (req, res) => {
   try {
+    const totalGroupsResult = await pool.query("SELECT COUNT(*)::INTEGER AS total FROM groups");
+    const totalGroups = totalGroupsResult.rows[0].total;
+
     const result = await pool.query(
       `SELECT
           a.*,
@@ -145,15 +153,24 @@ export const getAdminAssignments = async (req, res) => {
        FROM assignments a
        LEFT JOIN submissions s ON s.assignment_id = a.id
        LEFT JOIN assignment_groups ag ON ag.assignment_id = a.id
-       WHERE a.created_by = $1
        GROUP BY a.id
-       ORDER BY a.created_at DESC`,
-      [req.user.id]
+       ORDER BY a.created_at DESC`
     );
+
+    const assignmentsWithStats = result.rows.map((assignment) => {
+      const targetCount = assignment.target_all_students
+        ? totalGroups
+        : assignment.group_ids.length;
+
+      return {
+        ...assignment,
+        target_groups_count: targetCount,
+      };
+    });
 
     return res.status(200).json({
       success: true,
-      assignments: result.rows,
+      assignments: assignmentsWithStats,
     });
   } catch (error) {
     console.error("Get admin assignments error:", error.message);
@@ -164,7 +181,6 @@ export const getAdminAssignments = async (req, res) => {
     });
   }
 };
-
 
 // 4. Update an existing assignment (Admin only)
 export const updateAssignment = async (req, res) => {
@@ -201,16 +217,14 @@ export const updateAssignment = async (req, res) => {
   try {
     await client.query("BEGIN");
 
-    // Verify that this assignment belongs to the logged-in admin
+    // Verify assignment exists
     const existing = await client.query(
-      `SELECT id FROM assignments
-       WHERE id = $1 AND created_by = $2`,
-      [assignmentId, req.user.id]
+      "SELECT id FROM assignments WHERE id = $1",
+      [assignmentId]
     );
 
     if (existing.rows.length === 0) {
       await client.query("ROLLBACK");
-
       return res.status(404).json({
         success: false,
         message: "Assignment not found",
@@ -221,11 +235,8 @@ export const updateAssignment = async (req, res) => {
       ? []
       : [...new Set(group_ids.map(Number))];
 
-    if (uniqueGroupIds.some(
-      (id) => !Number.isInteger(id) || id <= 0
-    )) {
+    if (uniqueGroupIds.some((id) => !Number.isInteger(id) || id <= 0)) {
       await client.query("ROLLBACK");
-
       return res.status(400).json({
         success: false,
         message: "Invalid group ID",
@@ -239,19 +250,18 @@ export const updateAssignment = async (req, res) => {
            onedrive_link = $3,
            deadline = $4,
            target_all_students = $5
-       WHERE id = $6 AND created_by = $7`,
+       WHERE id = $6`,
       [
         title.trim(),
-        description || null,
-        onedrive_link || null,
+        description ? description.trim() : null,
+        onedrive_link ? onedrive_link.trim() : null,
         deadline || null,
         Boolean(target_all_students),
         assignmentId,
-        req.user.id,
       ]
     );
 
-    // Replace the assignment's selected groups
+    // Replace assignment's selected groups
     await client.query(
       "DELETE FROM assignment_groups WHERE assignment_id = $1",
       [assignmentId]
@@ -281,12 +291,80 @@ export const updateAssignment = async (req, res) => {
     });
   } catch (error) {
     await client.query("ROLLBACK");
-
     console.error("Update assignment error:", error.message);
 
     return res.status(500).json({
       success: false,
       message: "Failed to update assignment",
+    });
+  } finally {
+    client.release();
+  }
+};
+
+// 5. Delete an assignment (Admin only - only when safe for existing records)
+export const deleteAssignment = async (req, res) => {
+  const { assignmentId } = req.params;
+
+  const parsedId = parseInt(assignmentId, 10);
+  if (!Number.isInteger(parsedId) || parsedId <= 0) {
+    return res.status(400).json({
+      success: false,
+      message: "Invalid assignment ID",
+    });
+  }
+
+  const client = await pool.connect();
+
+  try {
+    await client.query("BEGIN");
+
+    // Check if assignment exists
+    const assignmentCheck = await client.query(
+      "SELECT id, title FROM assignments WHERE id = $1",
+      [parsedId]
+    );
+
+    if (assignmentCheck.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({
+        success: false,
+        message: "Assignment not found",
+      });
+    }
+
+    // Check if there are confirmed submissions
+    const subCheck = await client.query(
+      "SELECT COUNT(*)::INTEGER AS sub_count FROM submissions WHERE assignment_id = $1",
+      [parsedId]
+    );
+
+    const subCount = subCheck.rows[0].sub_count;
+    if (subCount > 0) {
+      await client.query("ROLLBACK");
+      return res.status(400).json({
+        success: false,
+        message: `Cannot delete assignment "${assignmentCheck.rows[0].title}" because it already has ${subCount} confirmed submission(s). Student submission records must be preserved.`,
+      });
+    }
+
+    // Safe to delete: remove assignment groups and assignment
+    await client.query("DELETE FROM assignment_groups WHERE assignment_id = $1", [parsedId]);
+    await client.query("DELETE FROM assignments WHERE id = $1", [parsedId]);
+
+    await client.query("COMMIT");
+
+    return res.status(200).json({
+      success: true,
+      message: `Assignment "${assignmentCheck.rows[0].title}" deleted successfully`,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error("Delete assignment error:", error.message);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to delete assignment",
     });
   } finally {
     client.release();

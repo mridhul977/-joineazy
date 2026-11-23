@@ -1,4 +1,3 @@
-
 import pool from "../config/db.js";
 import bcrypt from "bcryptjs";
 import jwt from "jsonwebtoken";
@@ -12,6 +11,13 @@ export const register = async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Name, email and password are required",
+      });
+    }
+
+    if (name.trim().length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "Name cannot be empty",
       });
     }
 
@@ -36,16 +42,17 @@ export const register = async (req, res) => {
 
     const hashedPassword = await bcrypt.hash(password, 10);
 
+    // Public registration ALWAYS creates 'student' role. Admin accounts cannot be self-registered.
     const result = await pool.query(
       `INSERT INTO users (name, email, password, role)
        VALUES ($1, $2, $3, 'student')
-       RETURNING id, name, email, role`,
+       RETURNING id, name, email, role, created_at`,
       [name.trim(), email.toLowerCase().trim(), hashedPassword]
     );
 
     res.status(201).json({
       success: true,
-      message: "Registration successful",
+      message: "Registration successful! You can now log in.",
       user: result.rows[0],
     });
   } catch (error) {
@@ -83,10 +90,7 @@ export const login = async (req, res) => {
 
     const user = result.rows[0];
 
-    const passwordMatch = await bcrypt.compare(
-      password,
-      user.password
-    );
+    const passwordMatch = await bcrypt.compare(password, user.password);
 
     if (!passwordMatch) {
       return res.status(401).json({
@@ -120,6 +124,34 @@ export const login = async (req, res) => {
     res.status(500).json({
       success: false,
       message: "Login failed",
+    });
+  }
+};
+
+// GET CURRENT USER PROFILE
+export const getMe = async (req, res) => {
+  try {
+    const result = await pool.query(
+      "SELECT id, name, email, role, created_at FROM users WHERE id = $1",
+      [req.user.id]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({
+        success: false,
+        message: "User not found",
+      });
+    }
+
+    res.status(200).json({
+      success: true,
+      user: result.rows[0],
+    });
+  } catch (error) {
+    console.error("GetMe error:", error.message);
+    res.status(500).json({
+      success: false,
+      message: "Could not retrieve user profile",
     });
   }
 };

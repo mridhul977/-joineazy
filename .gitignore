@@ -5,4 +5,6 @@ node_modules/
 dist/
 coverage/
 *.log
+*.sql
+!backend/src/database/schema.sql
 .DS_Store
